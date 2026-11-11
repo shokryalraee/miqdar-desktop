@@ -3,6 +3,7 @@ const { app, BrowserWindow, ipcMain, shell, Menu, session } = require('electron'
 const { execFile } = require('child_process');
 const path = require('path'), fs = require('fs'), os = require('os'), http = require('http'), https = require('https');
 const { createPrinter, isVirtual } = require('./lib/printing');
+const escpos = require('./lib/escpos');
 const { isAllowedUrl, isAllowedOrigin, validatePrint, validateNetPost } = require('./lib/guard');
 
 const DEV = process.env.MIQDAR_DEV === '1';
@@ -92,6 +93,66 @@ ipcMain.handle('miqdar:print', async (e, raw) => {
   } catch (err) { return { ok: false, error: String(err && err.message || err).slice(0, 200) }; }
   finally { if (w && !w.isDestroyed()) w.destroy(); }
 });
+
+// ---- ESC/POS "image mode" for thermal receipt printers: render the receipt to a bitmap exactly `dots` wide and send it RAW (bypasses driver, paper size, margins) ----
+const BUILD_DOC = "(function(){var css='';for(var i=0;i<document.styleSheets.length;i++){try{var rs=document.styleSheets[i].cssRules;for(var j=0;j<rs.length;j++)css+=rs[j].cssText+'\\n';}catch(e){}}var pa=document.getElementById('printArea');return '<!doctype html><html dir=\"'+(document.documentElement.dir||'rtl')+'\" lang=\"'+(document.documentElement.lang||'ar')+'\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src \\'none\\'\"><style>'+css+'</style></head><body><div id=\"printArea\" style=\"display:block!important\">'+(pa?pa.innerHTML:'')+'</div></body></html>';})()";
+const WAIT_ASSETS = "Promise.race([Promise.all([document.fonts?document.fonts.ready:0].concat([].map.call(document.images,function(i){return i.complete?0:new Promise(function(x){i.onload=i.onerror=x})}))),new Promise(function(x){setTimeout(x,5000)})])";
+async function renderReceiptBitmap(wc, dots) {
+  const doc = await wc.executeJavaScript(BUILD_DOC);
+  const origin = new URL(wc.getURL()).origin; if (!isAllowedOrigin(origin, OPTS)) throw new Error('origin');
+  const vw = Math.round(dots * 0.495), zoom = dots / vw;   // layout at the receipt's CSS width (≈76mm for 80mm paper), rendered at `dots` device pixels
+  const w = new BrowserWindow({ show: false, width: dots, height: 1000, useContentSize: true, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+  try {
+    await w.loadURL(origin + '/manifest.webmanifest');   // same origin → fonts/images load; the page is then replaced by the receipt document (scripts blocked by CSP)
+    const c = w.webContents; c.setZoomFactor(zoom);
+    await c.executeJavaScript('document.open();document.write(' + JSON.stringify(doc) + ');document.close();');
+    await c.executeJavaScript(WAIT_ASSETS);
+    try { c.debugger.attach('1.3'); await c.debugger.sendCommand('Emulation.setEmulatedMedia', { media: 'print' }); } catch (_) {}
+    await c.insertCSS('html,body{margin:0!important;background:#fff!important}#printArea,#printArea .rc{width:100%!important;max-width:none!important;margin:0!important;box-sizing:border-box!important;box-shadow:none!important;border-radius:0!important}');
+    w.setContentSize(dots, 1000); await new Promise(r => setTimeout(r, 150));
+    const h = Math.min(8000, Math.max(40, Math.ceil(await c.executeJavaScript('Math.max(document.documentElement.scrollHeight,document.body.scrollHeight)') * zoom)));
+    w.setContentSize(dots, h); await new Promise(r => setTimeout(r, 250));
+    let img = await c.capturePage({ x: 0, y: 0, width: dots, height: h });
+    if (img.getSize().width !== dots) img = img.resize({ width: dots, quality: 'best' });   // Windows display scaling returns more pixels
+    const s = img.getSize(); return { bgra: img.toBitmap(), width: s.width, height: s.height };
+  } finally { if (!w.isDestroyed()) w.destroy(); }
+}
+const PS_RAW = `param([string]$Printer,[string]$File)
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public class MiqdarRaw {
+ [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] public class DOCINFO { public string pDocName; public string pOutputFile; public string pDataType; }
+ [DllImport("winspool.drv",CharSet=CharSet.Unicode,SetLastError=true)] public static extern bool OpenPrinter(string n,out IntPtr h,IntPtr d);
+ [DllImport("winspool.drv",SetLastError=true)] public static extern bool ClosePrinter(IntPtr h);
+ [DllImport("winspool.drv",CharSet=CharSet.Unicode,SetLastError=true)] public static extern bool StartDocPrinter(IntPtr h,int level,[In] DOCINFO di);
+ [DllImport("winspool.drv",SetLastError=true)] public static extern bool EndDocPrinter(IntPtr h);
+ [DllImport("winspool.drv",SetLastError=true)] public static extern bool StartPagePrinter(IntPtr h);
+ [DllImport("winspool.drv",SetLastError=true)] public static extern bool EndPagePrinter(IntPtr h);
+ [DllImport("winspool.drv",SetLastError=true)] public static extern bool WritePrinter(IntPtr h,byte[] b,int c,out int w);
+ public static void Send(string printer,byte[] data){ IntPtr h; if(!OpenPrinter(printer,out h,IntPtr.Zero)) throw new Exception("OpenPrinter "+Marshal.GetLastWin32Error());
+  DOCINFO di=new DOCINFO(); di.pDocName="Miqdar receipt"; di.pDataType="RAW";
+  if(!StartDocPrinter(h,1,di)){ ClosePrinter(h); throw new Exception("StartDocPrinter "+Marshal.GetLastWin32Error()); }
+  StartPagePrinter(h); int w; bool ok=WritePrinter(h,data,data.Length,out w); EndPagePrinter(h); EndDocPrinter(h); ClosePrinter(h);
+  if(!ok||w!=data.Length) throw new Exception("WritePrinter "+Marshal.GetLastWin32Error()); } }
+"@
+[MiqdarRaw]::Send($Printer,[IO.File]::ReadAllBytes($File))
+`;
+async function sendRaw(name, buf) {
+  if (DEV && process.env.MIQDAR_RAW_DUMP) { fs.writeFileSync(path.join(process.env.MIQDAR_RAW_DUMP, 'raw-' + Date.now() + '.bin'), buf); return; }   // tests: capture the bytes instead of spooling
+  const tmp = path.join(os.tmpdir(), 'miqdar-raw-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7));
+  fs.writeFileSync(tmp + '.bin', buf);
+  try {
+    if (process.platform === 'win32') {
+      fs.writeFileSync(tmp + '.ps1', PS_RAW, 'utf8');
+      await new Promise((res, rej) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', tmp + '.ps1', '-Printer', name, '-File', tmp + '.bin'], { timeout: 30000, windowsHide: true }, (er, so, se) => er ? rej(new Error('RAW: ' + String(se || er.message).slice(0, 160))) : res()));
+    } else await new Promise((res, rej) => execFile('lp', ['-d', name, '-o', 'raw', tmp + '.bin'], { timeout: 30000 }, er => er ? rej(er) : res()));
+  } finally { fs.unlink(tmp + '.bin', () => {}); fs.unlink(tmp + '.ps1', () => {}); }
+}
+const rasterJob = (wc, r) => ({ directName: 'raster', fallbackName: 'driver',
+  direct: async name => { const bm = await renderReceiptBitmap(wc, r.raster.dots); await sendRaw(name, escpos.buildReceipt(escpos.toMono(bm.bgra, bm.width, bm.height), bm.width, bm.height, r.copies)); },
+  pdf: name => wcPrint(wc, printOpts(r, name)),   // if RAW fails: back to the normal driver path (then its own PDF fallback is not tried — the driver result is reported)
+});
+
 // Print the CURRENT page (the web app's #printArea with ALL its CSS, fonts, images, SVG/QR) silently. Used for window.print()/Ctrl+P and by the adapter
 // (native-print.js puts the document into #printArea first), so paper output == the on-screen preview. printToPDF fallback uses the same page.
 const printCurrentPage = async (wc, opts) => {
@@ -100,7 +161,7 @@ const printCurrentPage = async (wc, opts) => {
   // fonts/images in #printArea are only requested once it is laid out (it is display:none on screen) → force a hidden layout pass and wait, else the print uses fallback fonts
   try { await wc.executeJavaScript("(async function(){var pa=document.getElementById('printArea'),old=pa?pa.getAttribute('style'):null;if(pa)pa.style.cssText='display:block!important;position:fixed;left:-99999px;top:0;visibility:hidden';await new Promise(function(r){requestAnimationFrame(function(){requestAnimationFrame(r)})});await Promise.race([Promise.all([document.fonts?document.fonts.ready:0].concat([].map.call(document.images,function(i){return i.complete?0:new Promise(function(x){i.onload=i.onerror=x})}))),new Promise(function(x){setTimeout(x,4000)})]);if(pa){if(old===null)pa.removeAttribute('style');else pa.setAttribute('style',old)}})()"); } catch (_) {}
   let css; try { css = await wc.insertCSS('@media print{html,body,#printArea{background:#fff!important}}'); } catch (_) {}   // no grey app background on paper
-  try { return await printer.printJob(r, jobFor(wc, r)); } finally { if (css) wc.removeInsertedCSS(css).catch(() => {}); }
+  try { return await printer.printJob(r, r.raster ? rasterJob(wc, r) : jobFor(wc, r)); } finally { if (css) wc.removeInsertedCSS(css).catch(() => {}); }
 };
 ipcMain.handle('miqdar:printPage', async (e, opts) => { if (!senderOk(e)) deny(); return printCurrentPage(e.sender, typeof opts === 'string' ? { printer: opts.slice(0, 200) } : (opts && typeof opts === 'object' ? opts : {})); });
 

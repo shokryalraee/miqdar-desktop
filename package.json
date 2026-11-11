@@ -9,7 +9,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/guard.test.js test/preload.test.js test/printing.test.js",
+    "test": "node --test test/guard.test.js test/preload.test.js test/printing.test.js test/escpos.test.js",
     "dist:win": "electron-builder --win nsis --x64 --publish never",
     "dist:mac": "electron-builder --mac dmg zip --x64 --arm64 --publish never",
     "release:win": "electron-builder --win nsis --x64 --publish always",
