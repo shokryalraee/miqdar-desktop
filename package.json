@@ -1,7 +1,7 @@
 {
   "name": "miqdar-cashier",
   "productName": "مقدار كاشير",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Miqdar Cashier — official Windows app: opens Miqdar and prints silently by printer name",
   "main": "main.js",
   "author": "Miqdar",
@@ -9,9 +9,12 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/guard.test.js",
-    "dist": "electron-builder --win nsis --x64 --publish never",
-    "release": "electron-builder --win nsis --x64 --publish always"
+    "test": "node --test test/guard.test.js test/preload.test.js",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "dist:mac": "electron-builder --mac dmg zip --x64 --arm64 --publish never",
+    "release:win": "electron-builder --win nsis --x64 --publish always",
+    "release:mac": "electron-builder --mac dmg zip --x64 --arm64 --publish always",
+    "icons": "python3 scripts/make-icons.py"
   },
   "dependencies": {
     "electron-updater": "^6.8.11",
@@ -24,10 +27,75 @@
   "build": {
     "appId": "com.miqdarerp.cashier",
     "productName": "Miqdar Cashier",
-    "directories": { "output": "dist" },
-    "files": ["main.js", "preload.js", "lib/**", "package.json"],
-    "publish": [{ "provider": "github", "owner": "shokryalraee", "repo": "miqdar-desktop", "releaseType": "release" }],
-    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Miqdar-Cashier-Setup-${version}.exe" },
-    "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true }
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "lib/**",
+      "build/icon.png",
+      "package.json"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "shokryalraee",
+        "repo": "miqdar-desktop",
+        "releaseType": "release"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "Miqdar-Setup-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
+    },
+    "mac": {
+      "category": "public.app-category.business",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "Miqdar-${arch}-mac.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false
+    },
+    "dmg": {
+      "artifactName": "Miqdar-${arch}.${ext}",
+      "icon": "build/icon.icns"
+    }
   }
 }

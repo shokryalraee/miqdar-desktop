@@ -1,5 +1,6 @@
 'use strict';
 const { app, BrowserWindow, ipcMain, shell, Menu, session } = require('electron');
+const { execFile } = require('child_process');
 const path = require('path'), fs = require('fs'), os = require('os'), http = require('http'), https = require('https');
 const { isAllowedUrl, isAllowedOrigin, validatePrint, validateNetPost } = require('./lib/guard');
 
@@ -12,6 +13,8 @@ const writeCfg = o => { try { fs.writeFileSync(cfgFile(), JSON.stringify({ ...re
 const startUrl = () => { const u = process.env.MIQDAR_URL || readCfg().url || 'https://app.miqdarerp.com'; return isAllowedUrl(u, OPTS) ? u : 'https://app.miqdarerp.com'; };
 
 let win;
+if (process.platform === 'win32') app.setAppUserModelId('com.miqdarerp.cashier');   // proper Windows identity (taskbar / notifications)
+const ICON = path.join(__dirname, 'build', 'icon.png');
 if (!app.requestSingleInstanceLock()) app.quit();
 app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.focus(); } });
 
@@ -19,11 +22,15 @@ const senderOk = e => { try { return isAllowedOrigin(new URL(e.senderFrame.url).
 const deny = () => { const e = new Error('origin not allowed'); e.code = 'ORIGIN'; throw e; };
 
 function createWindow() {
-  win = new BrowserWindow({ width: 1280, height: 800, show: false, autoHideMenuBar: true, fullscreen: !!readCfg().fullscreen,
+  win = new BrowserWindow({ width: 1280, height: 800, show: false, autoHideMenuBar: true, icon: ICON, fullscreen: !!readCfg().fullscreen,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
   win.once('ready-to-show', () => win.show());
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });   // external links → system browser
   win.webContents.on('will-navigate', (ev, url) => { if (!isAllowedUrl(url, OPTS)) { ev.preventDefault(); if (/^https?:/.test(url)) shell.openExternal(url); } });
+  // offline / unreachable: a calm local page with retry (never a blank window or an error box)
+  win.webContents.on('did-fail-load', (_e, code, _d, url, isMain) => { if (!isMain || code === -3) return;
+    const page = '<meta charset=utf-8><body style="font:16px system-ui;text-align:center;padding:12vh 20px;direction:rtl"><h2>لا يوجد اتصال بالإنترنت</h2><p>تأكد من الشبكة ثم أعد المحاولة.<br>No internet connection.</p><button style="font-size:16px;padding:8px 22px" onclick="location.href=\''+String(url).replace(/[\\\'"<>]/g, '')+'\'">إعادة المحاولة / Retry</button></body>';
+    win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(page)); });
   win.loadURL(startUrl());
 }
 
@@ -33,7 +40,8 @@ function buildMenu() {
     { label: 'شاشة كاملة', type: 'checkbox', checked: !!c.fullscreen, accelerator: 'F11', click: i => { writeCfg({ fullscreen: i.checked }); win && win.setFullScreen(i.checked); } },
     { label: 'تشغيل مع ويندوز', type: 'checkbox', checked: app.getLoginItemSettings().openAtLogin, click: i => { writeCfg({ autostart: i.checked }); app.setLoginItemSettings({ openAtLogin: i.checked }); } },
     { label: 'إعادة تحميل', accelerator: 'CmdOrCtrl+R', click: () => win && win.reload() },
-    { type: 'separator' }, { role: 'quit', label: 'خروج' } ] }]));
+    { type: 'separator' }, { role: 'quit', label: 'خروج' } ] },
+    { label: 'تحرير', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] }]));   // Edit menu: copy/paste shortcuts need it on macOS
 }
 
 // ---- IPC (every handler re-checks the calling frame's origin) ----
@@ -65,9 +73,12 @@ ipcMain.handle('miqdar:print', async (e, raw) => {
   let w;
   try {
     if (r.source === 'pdfBase64') {
-      const pdf = require('pdf-to-printer'); const f = path.join(os.tmpdir(), 'miqdar-' + Date.now() + '.pdf');
+      const f = path.join(os.tmpdir(), 'miqdar-' + Date.now() + '.pdf');
       fs.writeFileSync(f, Buffer.from(r.pdfBase64, 'base64'));
-      try { await pdf.print(f, { printer: r.printer || undefined, copies: r.copies, scale: 'fit' }); } finally { fs.unlink(f, () => {}); }
+      try {
+        if (process.platform === 'win32') await require('pdf-to-printer').print(f, { printer: r.printer || undefined, copies: r.copies, scale: 'fit' });
+        else await new Promise((res, rej) => execFile('lp', [...(r.printer ? ['-d', r.printer] : []), '-n', String(r.copies), '-o', 'fit-to-page', f], { timeout: 30000 }, er => er ? rej(er) : res()));   // macOS / Linux (CUPS); printer name was checked against the system list above
+      } finally { fs.unlink(f, () => {}); }
       return { ok: true };
     }
     w = hiddenWin();
@@ -97,6 +108,8 @@ app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((wc, perm, cb) => cb(false));   // no camera/mic/geo etc.
   if (readCfg().autostart != null) app.setLoginItemSettings({ openAtLogin: !!readCfg().autostart });
   buildMenu(); createWindow();
-  if (app.isPackaged) { try { const { autoUpdater } = require('electron-updater'); autoUpdater.checkForUpdatesAndNotify().catch(() => {}); } catch (_) {} }
+  // silent background update: no toast, no dialog, errors swallowed (macOS needs a signed app to self-update; until then new versions are installed manually)
+  if (app.isPackaged) { try { const { autoUpdater } = require('electron-updater'); autoUpdater.autoDownload = true; autoUpdater.autoInstallOnAppQuit = true; autoUpdater.on('error', () => {}); autoUpdater.checkForUpdates().catch(() => {}); } catch (_) {} }
 });
 app.on('window-all-closed', () => app.quit());
+app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
