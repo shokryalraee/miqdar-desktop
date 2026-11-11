@@ -19,7 +19,7 @@ if (isAllowedOrigin(location.origin, { dev, hosts })) {
     printers: () => ipcRenderer.invoke('miqdar:printers'),
     print: req => ipcRenderer.invoke('miqdar:print', req),
     netPost: req => ipcRenderer.invoke('miqdar:netpost', req),
-    printPage: printer => ipcRenderer.invoke('miqdar:printPage', printer || ''),
+    printPage: opts => ipcRenderer.invoke('miqdar:printPage', opts || {}),
     diag: () => ipcRenderer.invoke('miqdar:diag'),
   }));
   // Any window.print() from the page (the web app's last-resort path) must NEVER open the system dialog: redirect it to the silent main-process path.

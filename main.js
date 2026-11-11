@@ -25,7 +25,7 @@ const deny = () => { const e = new Error('origin not allowed'); e.code = 'ORIGIN
 function createWindow() {
   win = new BrowserWindow({ width: 1280, height: 800, show: false, autoHideMenuBar: true, icon: ICON, fullscreen: !!readCfg().fullscreen,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
-  win.webContents.on('before-input-event', (ev, input) => { if ((input.control || input.meta) && !input.alt && String(input.key).toLowerCase() === 'p' && input.type === 'keyDown') { ev.preventDefault(); printCurrentPage(win.webContents, '').then(r => { if (!r.ok && win && !win.isDestroyed()) win.webContents.executeJavaScript('window.dispatchEvent(new CustomEvent("miqdar-print-error",{detail:' + JSON.stringify(String(r.error || '')) + '}))').catch(() => {}); }); } });   // Ctrl/Cmd+P → silent path, no dialog
+  win.webContents.on('before-input-event', (ev, input) => { if ((input.control || input.meta) && !input.alt && String(input.key).toLowerCase() === 'p' && input.type === 'keyDown') { ev.preventDefault(); printCurrentPage(win.webContents, {}).then(r => { if (!r.ok && win && !win.isDestroyed()) win.webContents.executeJavaScript('window.dispatchEvent(new CustomEvent("miqdar-print-error",{detail:' + JSON.stringify(String(r.error || '')) + '}))').catch(() => {}); }); } });   // Ctrl/Cmd+P → silent path, no dialog
   win.once('ready-to-show', () => win.show());
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });   // external links → system browser
   win.webContents.on('will-navigate', (ev, url) => { if (!isAllowedUrl(url, OPTS)) { ev.preventDefault(); if (/^https?:/.test(url)) shell.openExternal(url); } });
@@ -64,7 +64,7 @@ function pageOpts(r) {
 }
 function printOpts(r, name) {
   const o = { silent: true, printBackground: true, copies: r.copies, deviceName: name, ...pageOpts(r) };
-  o.margins = r.margins ? { marginType: 'custom', top: px(r.margins.top), right: px(r.margins.right), bottom: px(r.margins.bottom), left: px(r.margins.left) } : { marginType: 'none' };
+  o.margins = r.pageMode && !r.margins ? { marginType: 'default' } : r.margins ? { marginType: 'custom', top: px(r.margins.top), right: px(r.margins.right), bottom: px(r.margins.bottom), left: px(r.margins.left) } : { marginType: 'none' };
   return o;
 }
 const wcPrint = (wc, o) => new Promise((res, rej) => wc.print(o, (ok, why) => ok ? res() : rej(new Error(why || 'print failed'))));
@@ -75,8 +75,8 @@ function printPdfFile(f, name, copies) {
 async function withPdfFile(buf, fn) { const f = path.join(os.tmpdir(), 'miqdar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.pdf'); fs.writeFileSync(f, buf); try { return await fn(f); } finally { fs.unlink(f, () => {}); } }
 // html / url / the current page → { direct, pdf } jobs for the orchestrator
 const jobFor = (wc, r) => ({
-  direct: name => wcPrint(wc, printOpts(r, name)),
-  pdf: name => wc.printToPDF({ printBackground: true, ...pageOpts(r), margins: { marginType: 'none' } }).then(buf => withPdfFile(buf, f => printPdfFile(f, name, r.copies))),
+  direct: name => (DEV && process.env.MIQDAR_FORCE_PDF === '1') ? Promise.reject(new Error('forced (test)')) : wcPrint(wc, printOpts(r, name)),   // MIQDAR_FORCE_PDF: tests the PDF fallback path
+  pdf: name => wc.printToPDF({ printBackground: true, ...(r.pageMode ? { preferCSSPageSize: !r.paper } : { margins: { marginType: 'none' } }), ...pageOpts(r) }).then(buf => withPdfFile(buf, f => printPdfFile(f, name, r.copies))),
 });
 
 ipcMain.handle('miqdar:print', async (e, raw) => {
@@ -92,9 +92,17 @@ ipcMain.handle('miqdar:print', async (e, raw) => {
   } catch (err) { return { ok: false, error: String(err && err.message || err).slice(0, 200) }; }
   finally { if (w && !w.isDestroyed()) w.destroy(); }
 });
-// the page's own window.print() (and Ctrl+P) is redirected here by the preload: prints the current page silently, never opens the system dialog
-const printCurrentPage = async (wc, printerName) => printer.printJob({ printer: printerName || '', copies: 1, paper: null, margins: null }, jobFor(wc, { copies: 1, paper: null, margins: null }));
-ipcMain.handle('miqdar:printPage', async (e, name) => { if (!senderOk(e)) deny(); return printCurrentPage(e.sender, typeof name === 'string' ? name.slice(0, 200) : ''); });
+// Print the CURRENT page (the web app's #printArea with ALL its CSS, fonts, images, SVG/QR) silently. Used for window.print()/Ctrl+P and by the adapter
+// (native-print.js puts the document into #printArea first), so paper output == the on-screen preview. printToPDF fallback uses the same page.
+const printCurrentPage = async (wc, opts) => {
+  let r; try { r = validatePrint({ type: 'invoice', ...(opts || {}), html: 'x' }, OPTS); } catch (err) { return { ok: false, error: err.message }; }
+  r.pageMode = true;
+  // fonts/images in #printArea are only requested once it is laid out (it is display:none on screen) → force a hidden layout pass and wait, else the print uses fallback fonts
+  try { await wc.executeJavaScript("(async function(){var pa=document.getElementById('printArea'),old=pa?pa.getAttribute('style'):null;if(pa)pa.style.cssText='display:block!important;position:fixed;left:-99999px;top:0;visibility:hidden';await new Promise(function(r){requestAnimationFrame(function(){requestAnimationFrame(r)})});await Promise.race([Promise.all([document.fonts?document.fonts.ready:0].concat([].map.call(document.images,function(i){return i.complete?0:new Promise(function(x){i.onload=i.onerror=x})}))),new Promise(function(x){setTimeout(x,4000)})]);if(pa){if(old===null)pa.removeAttribute('style');else pa.setAttribute('style',old)}})()"); } catch (_) {}
+  let css; try { css = await wc.insertCSS('@media print{html,body,#printArea{background:#fff!important}}'); } catch (_) {}   // no grey app background on paper
+  try { return await printer.printJob(r, jobFor(wc, r)); } finally { if (css) wc.removeInsertedCSS(css).catch(() => {}); }
+};
+ipcMain.handle('miqdar:printPage', async (e, opts) => { if (!senderOk(e)) deny(); return printCurrentPage(e.sender, typeof opts === 'string' ? { printer: opts.slice(0, 200) } : (opts && typeof opts === 'object' ? opts : {})); });
 
 // LAN printer POST from the main process: no mixed-content block, and a self-signed printer certificate is accepted ONLY for this validated private IP.
 ipcMain.handle('miqdar:netpost', async (e, raw) => {
