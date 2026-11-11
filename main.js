@@ -2,6 +2,7 @@
 const { app, BrowserWindow, ipcMain, shell, Menu, session } = require('electron');
 const { execFile } = require('child_process');
 const path = require('path'), fs = require('fs'), os = require('os'), http = require('http'), https = require('https');
+const { createPrinter, isVirtual } = require('./lib/printing');
 const { isAllowedUrl, isAllowedOrigin, validatePrint, validateNetPost } = require('./lib/guard');
 
 const DEV = process.env.MIQDAR_DEV === '1';
@@ -24,6 +25,7 @@ const deny = () => { const e = new Error('origin not allowed'); e.code = 'ORIGIN
 function createWindow() {
   win = new BrowserWindow({ width: 1280, height: 800, show: false, autoHideMenuBar: true, icon: ICON, fullscreen: !!readCfg().fullscreen,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+  win.webContents.on('before-input-event', (ev, input) => { if ((input.control || input.meta) && !input.alt && String(input.key).toLowerCase() === 'p' && input.type === 'keyDown') { ev.preventDefault(); printCurrentPage(win.webContents, '').then(r => { if (!r.ok && win && !win.isDestroyed()) win.webContents.executeJavaScript('window.dispatchEvent(new CustomEvent("miqdar-print-error",{detail:' + JSON.stringify(String(r.error || '')) + '}))').catch(() => {}); }); } });   // Ctrl/Cmd+P → silent path, no dialog
   win.once('ready-to-show', () => win.show());
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });   // external links → system browser
   win.webContents.on('will-navigate', (ev, url) => { if (!isAllowedUrl(url, OPTS)) { ev.preventDefault(); if (/^https?:/.test(url)) shell.openExternal(url); } });
@@ -46,49 +48,53 @@ function buildMenu() {
 
 // ---- IPC (every handler re-checks the calling frame's origin) ----
 ipcMain.on('miqdar:version', e => { e.returnValue = senderOk(e) ? app.getVersion() : ''; });
-ipcMain.handle('miqdar:printers', async e => {
-  if (!senderOk(e)) deny();
-  const list = await e.sender.getPrintersAsync();
-  return list.map(p => ({ name: String(p.name), isDefault: !!p.isDefault, status: Number(p.status) || 0 }));
-});
+const sysPrinters = async () => (await (win && !win.isDestroyed() ? win.webContents : BrowserWindow.getAllWindows()[0].webContents).getPrintersAsync()).map(p => ({ name: String(p.name), isDefault: !!p.isDefault, status: Number(p.status) || 0 }));
+const printer = createPrinter({ getPrinters: sysPrinters, platform: process.platform });
+ipcMain.handle('miqdar:printers', async e => { if (!senderOk(e)) deny(); return (await sysPrinters()).map(p => ({ ...p, virtual: isVirtual(p.name) })); });
+ipcMain.handle('miqdar:diag', async e => { if (!senderOk(e)) deny(); return { app: app.getVersion(), electron: process.versions.electron, ...(await printer.diag()) }; });
 
-function hiddenWin() { return new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, javascript: false, offscreen: false } }); }
+function hiddenWin() { return new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, javascript: false } }); }
 const mmToMicrons = v => Math.round(v * 1000);
-function printOpts(r) {
-  const o = { silent: true, printBackground: true, copies: r.copies };
-  if (r.printer) o.deviceName = r.printer;
+const px = mm => Math.round(mm * 96 / 25.4);   // Electron custom margins are in pixels
+function pageOpts(r) {
+  const o = {};
   if (r.paper === 'A4') o.pageSize = 'A4';
   else if (r.paper) o.pageSize = { width: mmToMicrons(r.paper.w_mm), height: mmToMicrons(r.paper.h_mm) };
-  const px = mm => Math.round(mm * 96 / 25.4);   // Electron custom margins are in pixels
-  if (r.margins) { o.margins = { marginType: 'custom', top: px(r.margins.top), right: px(r.margins.right), bottom: px(r.margins.bottom), left: px(r.margins.left) }; }
-  else o.margins = { marginType: 'none' };
   return o;
 }
-function wcPrint(wc, o) { return new Promise((res, rej) => wc.print(o, (ok, why) => ok ? res() : rej(new Error(why || 'print failed')))); }
+function printOpts(r, name) {
+  const o = { silent: true, printBackground: true, copies: r.copies, deviceName: name, ...pageOpts(r) };
+  o.margins = r.margins ? { marginType: 'custom', top: px(r.margins.top), right: px(r.margins.right), bottom: px(r.margins.bottom), left: px(r.margins.left) } : { marginType: 'none' };
+  return o;
+}
+const wcPrint = (wc, o) => new Promise((res, rej) => wc.print(o, (ok, why) => ok ? res() : rej(new Error(why || 'print failed'))));
+function printPdfFile(f, name, copies) {
+  if (process.platform === 'win32') return require('pdf-to-printer').print(f, { printer: name, copies, scale: 'fit' });   // bundled SumatraPDF, silent
+  return new Promise((res, rej) => execFile('lp', ['-d', name, '-n', String(copies), '-o', 'fit-to-page', f], { timeout: 30000 }, er => er ? rej(er) : res()));   // macOS / Linux (CUPS)
+}
+async function withPdfFile(buf, fn) { const f = path.join(os.tmpdir(), 'miqdar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.pdf'); fs.writeFileSync(f, buf); try { return await fn(f); } finally { fs.unlink(f, () => {}); } }
+// html / url / the current page → { direct, pdf } jobs for the orchestrator
+const jobFor = (wc, r) => ({
+  direct: name => wcPrint(wc, printOpts(r, name)),
+  pdf: name => wc.printToPDF({ printBackground: true, ...pageOpts(r), margins: { marginType: 'none' } }).then(buf => withPdfFile(buf, f => printPdfFile(f, name, r.copies))),
+});
 
 ipcMain.handle('miqdar:print', async (e, raw) => {
   if (!senderOk(e)) deny();
   let r; try { r = validatePrint(raw, OPTS); } catch (err) { return { ok: false, error: err.message }; }
-  if (r.printer) { const names = (await e.sender.getPrintersAsync()).map(p => p.name); if (!names.includes(r.printer)) return { ok: false, error: 'PRINTER_NOT_FOUND: ' + r.printer }; }
+  if (r.source === 'pdfBase64') return printer.printJob(r, { direct: name => withPdfFile(Buffer.from(r.pdfBase64, 'base64'), f => printPdfFile(f, name, r.copies)) });
   let w;
   try {
-    if (r.source === 'pdfBase64') {
-      const f = path.join(os.tmpdir(), 'miqdar-' + Date.now() + '.pdf');
-      fs.writeFileSync(f, Buffer.from(r.pdfBase64, 'base64'));
-      try {
-        if (process.platform === 'win32') await require('pdf-to-printer').print(f, { printer: r.printer || undefined, copies: r.copies, scale: 'fit' });
-        else await new Promise((res, rej) => execFile('lp', [...(r.printer ? ['-d', r.printer] : []), '-n', String(r.copies), '-o', 'fit-to-page', f], { timeout: 30000 }, er => er ? rej(er) : res()));   // macOS / Linux (CUPS); printer name was checked against the system list above
-      } finally { fs.unlink(f, () => {}); }
-      return { ok: true };
-    }
     w = hiddenWin();
     if (r.source === 'html') await w.loadURL('data:text/html;charset=utf-8;base64,' + Buffer.from(r.html, 'utf8').toString('base64'));
     else await w.loadURL(r.url);
-    await wcPrint(w.webContents, printOpts(r));
-    return { ok: true };
+    return await printer.printJob(r, jobFor(w.webContents, r));
   } catch (err) { return { ok: false, error: String(err && err.message || err).slice(0, 200) }; }
   finally { if (w && !w.isDestroyed()) w.destroy(); }
 });
+// the page's own window.print() (and Ctrl+P) is redirected here by the preload: prints the current page silently, never opens the system dialog
+const printCurrentPage = async (wc, printerName) => printer.printJob({ printer: printerName || '', copies: 1, paper: null, margins: null }, jobFor(wc, { copies: 1, paper: null, margins: null }));
+ipcMain.handle('miqdar:printPage', async (e, name) => { if (!senderOk(e)) deny(); return printCurrentPage(e.sender, typeof name === 'string' ? name.slice(0, 200) : ''); });
 
 // LAN printer POST from the main process: no mixed-content block, and a self-signed printer certificate is accepted ONLY for this validated private IP.
 ipcMain.handle('miqdar:netpost', async (e, raw) => {

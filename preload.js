@@ -1,6 +1,6 @@
 'use strict';
 // Narrow bridge: window.MiqdarNative = { version, printers(), print(req), netPost(req) }. No fs/ipc/node exposed.
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webFrame } = require('electron');
 // NOTE: sandboxed preloads cannot require() local files, so the origin rule is inlined here (same rule as lib/guard.js; test/preload.test.js checks both).
 const BASE = ['miqdarerp.com'];
 function isAllowedOrigin(o, opts) {
@@ -19,5 +19,9 @@ if (isAllowedOrigin(location.origin, { dev, hosts })) {
     printers: () => ipcRenderer.invoke('miqdar:printers'),
     print: req => ipcRenderer.invoke('miqdar:print', req),
     netPost: req => ipcRenderer.invoke('miqdar:netpost', req),
+    printPage: printer => ipcRenderer.invoke('miqdar:printPage', printer || ''),
+    diag: () => ipcRenderer.invoke('miqdar:diag'),
   }));
+  // Any window.print() from the page (the web app's last-resort path) must NEVER open the system dialog: redirect it to the silent main-process path.
+  try { webFrame.executeJavaScript("(function(){var n=function(){var N=window.MiqdarNative;if(!N){return;}var p=N.printPage(window.__miqdarPrinter||'');p.then(function(r){if(r&&!r.ok){try{window.__miqdarPrintErr=r.error;window.dispatchEvent(new CustomEvent('miqdar-print-error',{detail:r.error}));}catch(e){}}});return p;};try{Object.defineProperty(window,'print',{value:n,writable:false,configurable:false});}catch(e){window.print=n;}})();"); } catch (e) {}
 }
