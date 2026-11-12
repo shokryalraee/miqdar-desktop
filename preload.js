@@ -16,6 +16,9 @@ const hosts = (process.env.MIQDAR_HOSTS || '').split(',').map(s => s.trim()).fil
 if (isAllowedOrigin(location.origin, { dev, hosts })) {
   contextBridge.exposeInMainWorld('MiqdarNative', Object.freeze({
     version: ipcRenderer.sendSync('miqdar:version'),
+    api: 3,   // bridge level: the web feature-detects (printPage/raster/update) so a newer web never breaks an older shell
+    update: () => ipcRenderer.invoke('miqdar:update'),
+    restartForUpdate: () => ipcRenderer.invoke('miqdar:restart'),
     printers: () => ipcRenderer.invoke('miqdar:printers'),
     print: req => ipcRenderer.invoke('miqdar:print', req),
     netPost: req => ipcRenderer.invoke('miqdar:netpost', req),

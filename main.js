@@ -4,6 +4,7 @@ const { execFile } = require('child_process');
 const path = require('path'), fs = require('fs'), os = require('os'), http = require('http'), https = require('https');
 const { createPrinter, isVirtual } = require('./lib/printing');
 const escpos = require('./lib/escpos');
+const { createUpdater } = require('./lib/updater');
 const { isAllowedUrl, isAllowedOrigin, validatePrint, validateNetPost } = require('./lib/guard');
 
 const DEV = process.env.MIQDAR_DEV === '1';
@@ -14,7 +15,7 @@ const readCfg = () => { try { return JSON.parse(fs.readFileSync(cfgFile(), 'utf8
 const writeCfg = o => { try { fs.writeFileSync(cfgFile(), JSON.stringify({ ...readCfg(), ...o }, null, 1)); } catch (e) {} };
 const startUrl = () => { const u = process.env.MIQDAR_URL || readCfg().url || 'https://app.miqdarerp.com'; return isAllowedUrl(u, OPTS) ? u : 'https://app.miqdarerp.com'; };
 
-let win;
+let win, updater = null;
 if (process.platform === 'win32') app.setAppUserModelId('com.miqdarerp.cashier');   // proper Windows identity (taskbar / notifications)
 const ICON = path.join(__dirname, 'build', 'icon.png');
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -48,6 +49,8 @@ function buildMenu() {
 }
 
 // ---- IPC (every handler re-checks the calling frame's origin) ----
+ipcMain.handle('miqdar:update', e => { if (!senderOk(e)) deny(); return updater ? updater.state() : { status: 'off', version: null, error: '' }; });
+ipcMain.handle('miqdar:restart', e => { if (!senderOk(e)) deny(); return updater ? updater.restart() : false; });
 ipcMain.on('miqdar:version', e => { e.returnValue = senderOk(e) ? app.getVersion() : ''; });
 const sysPrinters = async () => (await (win && !win.isDestroyed() ? win.webContents : BrowserWindow.getAllWindows()[0].webContents).getPrintersAsync()).map(p => ({ name: String(p.name), isDefault: !!p.isDefault, status: Number(p.status) || 0 }));
 const printer = createPrinter({ getPrinters: sysPrinters, platform: process.platform });
@@ -183,8 +186,16 @@ app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((wc, perm, cb) => cb(false));   // no camera/mic/geo etc.
   if (readCfg().autostart != null) app.setLoginItemSettings({ openAtLogin: !!readCfg().autostart });
   buildMenu(); createWindow();
-  // silent background update: no toast, no dialog, errors swallowed (macOS needs a signed app to self-update; until then new versions are installed manually)
-  if (app.isPackaged) { try { const { autoUpdater } = require('electron-updater'); autoUpdater.autoDownload = true; autoUpdater.autoInstallOnAppQuit = true; autoUpdater.on('error', () => {}); autoUpdater.checkForUpdates().catch(() => {}); } catch (_) {} }
+  // silent background updates (Windows/NSIS unsigned OK; macOS needs a signed+notarized app). Check at start and every 4h; install when the app quits or on «restart now».
+  // The WEB UI is not part of the app (loaded live from the server) — only this thin shell updates.
+  if (app.isPackaged || (DEV && process.env.MIQDAR_UPDATE_URL)) {
+    try {
+      const { autoUpdater } = require('electron-updater');
+      if (DEV && process.env.MIQDAR_UPDATE_URL) { autoUpdater.forceDevUpdateConfig = true; autoUpdater.setFeedURL({ provider: 'generic', url: process.env.MIQDAR_UPDATE_URL }); }   // tests: local generic provider
+      updater = createUpdater({ autoUpdater, intervalMs: DEV && Number(process.env.MIQDAR_UPDATE_INTERVAL_MS) || undefined,
+        onChange: st => { try { win && !win.isDestroyed() && win.webContents.executeJavaScript('window.dispatchEvent(new CustomEvent("miqdar-update",{detail:' + JSON.stringify(st) + '}))').catch(() => {}); } catch (_) {} } }).start();
+    } catch (_) {}
+  }
 });
 app.on('window-all-closed', () => app.quit());
 app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });

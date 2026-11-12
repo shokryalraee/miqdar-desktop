@@ -17,8 +17,11 @@ npm run icons            # يولّد icon.ico/icns من build/icon.png (شعا�
 `contextIsolation:true`, `nodeIntegration:false`, `sandbox:true`. الـpreload يعرّف `MiqdarNative` فقط لو أصل الصفحة https على `miqdarerp.com` أو نطاق فرعي، والـmain يعيد فحص أصل المرسل في كل نداء. الروابط الخارجية تُفتح في المتصفح، والتنقل خارج النطاقات ممنوع، وكل الصلاحيات (كاميرا/موقع…) مرفوضة.
 الواجهة: `version` · `printers()` · `print({html|pdfBase64|url, printer, type:'invoice'|'a4'|'label', paper:{w_mm,h_mm}|'A4', copies, margins})` · `netPost({url,body})` (لطابعات الشبكة LAN فقط: IPv4 خاص + مسارين ثابتين). الملصق بدون اسم طابعة مرفوض دائماً. A4: HTML يطبع بـ`webContents.print`، و`pdfBase64` عبر `pdf-to-printer`.
 
+## البنية: قشرة رفيعة + ويب حي
+التطبيق **لا يجمّع الواجهة**؛ يفتح `app.miqdarerp.com` مباشرة، فكل تحديث للويب يصل بدون تثبيت. القشرة (main/preload + الطباعة الأصلية/RAW) هي الوحيدة اللي تتحدث بإصدار جديد. الويب يكشف القدرات (`MiqdarNative.api`، وجود `printPage`/`update`) فالويب الأحدث لا يكسر قشرة أقدم، ولو الإصدار أقل من `MIN_DESKTOP` في `web/native-print.js` يظهر شريط هادئ «نسخة التطبيق قديمة». منطق الطباعة (القوالب، اختيار الطابعة لكل نوع، الملصق) كله في الويب؛ القشرة تنفّذ فقط.
+
 ## التحديث التلقائي
-`electron-updater` من GitHub Releases في المستودع **العام** `shokryalraee/miqdar-desktop` عند كل تشغيل للنسخة المثبّتة (المستودع الخاص ما ينفع: التحديث يحتاج توكن).
+`electron-updater` (فحص عند التشغيل وكل 4 ساعات، تنزيل بالخلفية، تثبيت عند الإغلاق، بدون أي نافذة/إشعار؛ شريط هادئ في الويب) من GitHub Releases في المستودع **العام** `shokryalraee/miqdar-desktop` عند كل تشغيل للنسخة المثبّتة (المستودع الخاص ما ينفع: التحديث يحتاج توكن).
 
 ## ماك: الطباعة الصامتة بالاسم
 `webContents.print({silent:true, deviceName})` يشتغل على ماك، والاسم لازم يكون **اسم النظام** (مثل `EPSON_TM_T20`) مو الاسم الودّي؛ و`printers()` ترجّع `name` من `getPrintersAsync()` وهو اسم النظام أصلاً. الـPDF على ماك/لينكس عبر `lp` (CUPS). مراجعة كود فقط: ما جُرّب على ماك حقيقي.
@@ -51,6 +54,10 @@ npm run icons            # يولّد icon.ico/icns من build/icon.png (شعا�
 
 ## أسماء الملفات الثابتة (لروابط الموقع)
 `Miqdar-Setup-x64.exe` · `Miqdar-x64.dmg` (Intel) · `Miqdar-arm64.dmg` (Apple Silicon) → `https://github.com/shokryalraee/miqdar-desktop/releases/latest/download/<الاسم>`.
+
+## الإصدار بنقرة وحدة
+Actions ← build ← **Run workflow** ← خانة `version` (مثل 1.1.3): يبني ويندوز+ماك وينشر الـRelease لحاله (electron-builder ينشئ الـtag) ثم يحدّث `package.json`. أو `./release.sh 1.1.3`. دفع tag `v*` ما زال يشتغل.
+**اختبار التحديث:** `native-update-e2e.js` (Electron حقيقي 1.1.2 + خادم generic محلي يعلن 1.1.3): فحص، تنزيل مُتحقَّق بـsha512، حالة ready، الشريط يظهر، لا نوافذ؛ و`updater.test.js` للفاصل 4 ساعات وابتلاع الأخطاء. **خطوة تثبيت NSIS الصامت على ويندوز ما تتجرّب في الحاوية** (التجربة على لينكس/AppImage بنفس آلة حالات electron-updater).
 
 ## الإصدار (CI)
 هذا المجلد **مستقل بالكامل** (ما يستورد شي من خارجه) ويعيش كمستودع عام `shokryalraee/miqdar-desktop`. `.github/workflows/build.yml` يبني matrix على `windows-latest` و`macos-latest` بالـ`GITHUB_TOKEN` الافتراضي: دفع tag بصيغة `v1.0.0` ينشر Release فيه الـ.exe والـdmg/zip و`latest*.yml` (لازم للتحديث التلقائي)؛ ويدوياً (workflow_dispatch) يرفع artifact فقط. خطوات المالك: `OWNER-STEPS.md`.
