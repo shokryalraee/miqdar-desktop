@@ -17,6 +17,7 @@ if (isAllowedOrigin(location.origin, { dev, hosts })) {
   contextBridge.exposeInMainWorld('MiqdarNative', Object.freeze({
     version: ipcRenderer.sendSync('miqdar:version'),
     api: 3,   // bridge level: the web feature-detects (printPage/raster/update) so a newer web never breaks an older shell
+    agent: () => ipcRenderer.invoke('miqdar:agent'),
     update: () => ipcRenderer.invoke('miqdar:update'),
     restartForUpdate: () => ipcRenderer.invoke('miqdar:restart'),
     printers: () => ipcRenderer.invoke('miqdar:printers'),

@@ -1,7 +1,7 @@
 {
   "name": "miqdar-cashier",
   "productName": "مقدار كاشير",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Miqdar Cashier — official Windows app: opens Miqdar and prints silently by printer name",
   "main": "main.js",
   "author": "Miqdar",
@@ -9,7 +9,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/guard.test.js test/preload.test.js test/printing.test.js test/escpos.test.js test/updater.test.js",
+    "test": "node --test test/guard.test.js test/preload.test.js test/printing.test.js test/escpos.test.js test/updater.test.js test/agent.test.js",
     "dist:win": "electron-builder --win nsis --x64 --publish never",
     "dist:mac": "electron-builder --mac dmg zip --x64 --arm64 --publish never",
     "release:win": "electron-builder --win nsis --x64 --publish always",

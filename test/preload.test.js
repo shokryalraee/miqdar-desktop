@@ -11,7 +11,7 @@ function run(origin, env, scripts) {
 }
 test('preload exposes MiqdarNative only on allowed https origins', () => {
   const e = run('https://app.miqdarerp.com'); assert.ok(e.MiqdarNative);
-  assert.deepEqual(Object.keys(e.MiqdarNative).sort(), ['api', 'diag', 'netPost', 'print', 'printPage', 'printers', 'restartForUpdate', 'update', 'version']);
+  assert.deepEqual(Object.keys(e.MiqdarNative).sort(), ['agent', 'api', 'diag', 'netPost', 'print', 'printPage', 'printers', 'restartForUpdate', 'update', 'version']);
   assert.equal(e.MiqdarNative.version, '1.2.3');
   for (const o of ['https://evil.io', 'https://miqdarerp.com.evil.io', 'http://app.miqdarerp.com', 'null', 'file://', 'https://evilmiqdarerp.com']) assert.equal(run(o).MiqdarNative, undefined, o);
   assert.equal(run('http://localhost:8765').MiqdarNative, undefined);

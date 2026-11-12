@@ -1,10 +1,11 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, shell, Menu, session } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Menu, Tray, nativeImage, clipboard, session } = require('electron');
 const { execFile } = require('child_process');
 const path = require('path'), fs = require('fs'), os = require('os'), http = require('http'), https = require('https');
 const { createPrinter, isVirtual } = require('./lib/printing');
 const escpos = require('./lib/escpos');
 const { createUpdater } = require('./lib/updater');
+const { createAgent } = require('./lib/agent-core');
 const { isAllowedUrl, isAllowedOrigin, validatePrint, validateNetPost } = require('./lib/guard');
 
 const DEV = process.env.MIQDAR_DEV === '1';
@@ -42,7 +43,7 @@ function buildMenu() {
   const c = readCfg();
   Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: 'مقدار', submenu: [
     { label: 'شاشة كاملة', type: 'checkbox', checked: !!c.fullscreen, accelerator: 'F11', click: i => { writeCfg({ fullscreen: i.checked }); win && win.setFullScreen(i.checked); } },
-    { label: 'تشغيل مع ويندوز', type: 'checkbox', checked: app.getLoginItemSettings().openAtLogin, click: i => { writeCfg({ autostart: i.checked }); app.setLoginItemSettings({ openAtLogin: i.checked }); } },
+    { label: 'تشغيل مع ويندوز (وكيل الطباعة بالخلفية)', type: 'checkbox', checked: !!c.autostart, click: i => { writeCfg({ autostart: i.checked }); app.setLoginItemSettings({ openAtLogin: i.checked, args: ['--agent'] }); } },
     { label: 'إعادة تحميل', accelerator: 'CmdOrCtrl+R', click: () => win && win.reload() },
     { type: 'separator' }, { role: 'quit', label: 'خروج' } ] },
     { label: 'تحرير', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] }]));   // Edit menu: copy/paste shortcuts need it on macOS
@@ -52,7 +53,9 @@ function buildMenu() {
 ipcMain.handle('miqdar:update', e => { if (!senderOk(e)) deny(); return updater ? updater.state() : { status: 'off', version: null, error: '' }; });
 ipcMain.handle('miqdar:restart', e => { if (!senderOk(e)) deny(); return updater ? updater.restart() : false; });
 ipcMain.on('miqdar:version', e => { e.returnValue = senderOk(e) ? app.getVersion() : ''; });
-const sysPrinters = async () => (await (win && !win.isDestroyed() ? win.webContents : BrowserWindow.getAllWindows()[0].webContents).getPrintersAsync()).map(p => ({ name: String(p.name), isDefault: !!p.isDefault, status: Number(p.status) || 0 }));
+let hostWin = null;
+const anyWc = () => { if (win && !win.isDestroyed()) return win.webContents; if (!hostWin || hostWin.isDestroyed()) hostWin = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } }); return hostWin.webContents; };   // background (tray-only) mode has no main window
+const sysPrinters = async () => (await anyWc().getPrintersAsync()).map(p => ({ name: String(p.name), isDefault: !!p.isDefault, status: Number(p.status) || 0 }));
 const printer = createPrinter({ getPrinters: sysPrinters, platform: process.platform });
 ipcMain.handle('miqdar:printers', async e => { if (!senderOk(e)) deny(); return (await sysPrinters()).map(p => ({ ...p, virtual: isVirtual(p.name) })); });
 ipcMain.handle('miqdar:diag', async e => { if (!senderOk(e)) deny(); return { app: app.getVersion(), electron: process.versions.electron, ...(await printer.diag()) }; });
@@ -103,17 +106,21 @@ const WAIT_ASSETS = "Promise.race([Promise.all([document.fonts?document.fonts.re
 async function renderReceiptBitmap(wc, dots) {
   const doc = await wc.executeJavaScript(BUILD_DOC);
   const origin = new URL(wc.getURL()).origin; if (!isAllowedOrigin(origin, OPTS)) throw new Error('origin');
+  return renderDocBitmap(doc, origin, dots);
+}
+// doc = a full HTML document string; origin = allowed origin to load fonts/images from (or null → about:blank, the doc must then be self-contained)
+async function renderDocBitmap(doc, origin, dots) {
   const vw = Math.round(dots * 0.495), zoom = dots / vw;   // layout at the receipt's CSS width (≈76mm for 80mm paper), rendered at `dots` device pixels
   const w = new BrowserWindow({ show: false, width: dots, height: 1000, useContentSize: true, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
   try {
-    await w.loadURL(origin + '/manifest.webmanifest');   // same origin → fonts/images load; the page is then replaced by the receipt document (scripts blocked by CSP)
+    await w.loadURL(origin ? origin + '/manifest.webmanifest' : 'about:blank');   // same origin → fonts/images load; the page is then replaced by the receipt document (scripts blocked by CSP)
     const c = w.webContents; c.setZoomFactor(zoom);
     await c.executeJavaScript('document.open();document.write(' + JSON.stringify(doc) + ');document.close();');
     await c.executeJavaScript(WAIT_ASSETS);
     try { c.debugger.attach('1.3'); await c.debugger.sendCommand('Emulation.setEmulatedMedia', { media: 'print' }); } catch (_) {}
     await c.insertCSS('html,body{margin:0!important;background:#fff!important}#printArea,#printArea .rc{width:100%!important;max-width:none!important;margin:0!important;box-sizing:border-box!important;box-shadow:none!important;border-radius:0!important}');
     w.setContentSize(dots, 1000); await new Promise(r => setTimeout(r, 150));
-    const h = Math.min(8000, Math.max(40, Math.ceil(await c.executeJavaScript('Math.max(document.documentElement.scrollHeight,document.body.scrollHeight)') * zoom)));
+    const h = Math.min(8000, Math.max(40, Math.ceil(await c.executeJavaScript('(function(){var b=document.body.getBoundingClientRect();return Math.max(1,Math.ceil(b.bottom+(window.scrollY||0)))})()') * zoom)));
     w.setContentSize(dots, h); await new Promise(r => setTimeout(r, 250));
     let img = await c.capturePage({ x: 0, y: 0, width: dots, height: h });
     if (img.getSize().width !== dots) img = img.resize({ width: dots, quality: 'best' });   // Windows display scaling returns more pixels
@@ -182,10 +189,65 @@ ipcMain.handle('miqdar:netpost', async (e, raw) => {
   });
 });
 
-app.whenReady().then(() => {
+
+// ================= Miqdar Print Agent (local API on 127.0.0.1, see docs/PRINT-AGENT.md) =================
+// Lets the WEB app pick ANY installed printer by name: GET /printers, POST /print {html|pdf|escpos-raw}. Runs inside the desktop app; with `--agent` it is tray-only (no window).
+const BACKGROUND = process.argv.includes('--agent');
+let agent = null, tray = null, pairCode = '';
+async function withDocWindow(html, base, fn) {
+  const w = new BrowserWindow({ show: false, width: 800, height: 1000, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+  try {
+    await w.loadURL(base ? base + '/manifest.webmanifest' : 'about:blank');
+    const doc = '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'">' + html;   // the page's scripts never run; only our own executeJavaScript
+    await w.webContents.executeJavaScript('document.open();document.write(' + JSON.stringify(doc) + ');document.close();');
+    await w.webContents.executeJavaScript(WAIT_ASSETS);
+    return await fn(w.webContents);
+  } finally { if (!w.isDestroyed()) w.destroy(); }
+}
+async function agentExecute(spec) {
+  const r = { ...spec, copies: spec.copies || 1 };
+  let res;
+  if (spec.kind === 'raw') res = await printer.printJob(r, { directName: 'raw', direct: name => sendRaw(name, Buffer.concat(Array.from({ length: r.copies }, () => spec.bytes))) });
+  else if (spec.kind === 'pdf') res = await printer.printJob(r, { direct: name => withPdfFile(Buffer.from(spec.pdfBase64, 'base64'), f => printPdfFile(f, name, r.copies)) });
+  else if (spec.raster) res = await printer.printJob(r, { directName: 'raster', fallbackName: 'driver',
+    direct: async name => { const bm = await renderDocBitmap(spec.html, spec.baseUrl, spec.raster.dots); await sendRaw(name, escpos.buildReceipt(escpos.toMono(bm.bgra, bm.width, bm.height), bm.width, bm.height, r.copies)); },
+    pdf: name => withDocWindow(spec.html, spec.baseUrl, wc => wcPrint(wc, printOpts({ ...r, pageMode: !r.paper }, name))) });
+  else {   // html → silent driver print of the document (no dialog); PDF fallback on failure
+    r.pageMode = !r.paper && !r.margins;
+    res = await printer.printJob(r, { direct: name => withDocWindow(spec.html, spec.baseUrl, wc => wcPrint(wc, printOpts(r, name))),
+      pdf: name => withDocWindow(spec.html, spec.baseUrl, wc => wc.printToPDF({ printBackground: true, ...(r.pageMode ? { preferCSSPageSize: true } : { margins: { marginType: 'none' } }), ...pageOpts(r) }).then(buf => withPdfFile(buf, f => printPdfFile(f, name, r.copies)))) });
+  }
+  if (!res.ok) { const e = new Error(res.error || 'print failed'); e.code = res.code; throw e; }
+  return res;
+}
+function trayMenu() {
+  const c = readCfg(), port = agent ? agent.port() : 0;
+  return Menu.buildFromTemplate([
+    { label: 'مقدار — وكيل الطباعة' + (port ? ' (المنفذ ' + port + ')' : ' (متوقف)'), enabled: false },
+    { label: 'رمز الاقتران: ' + (agent ? agent.code() : '—'), enabled: false },
+    { label: 'نسخ رمز الاقتران', click: () => { try { clipboard.writeText(agent.code()); } catch (_) {} } },
+    { label: 'إلغاء كل الاقتران', click: () => agent && agent.revokeAll() },
+    { type: 'separator' },
+    { label: 'فتح مقدار', click: () => { if (win && !win.isDestroyed()) win.show(); else createWindow(); } },
+    { label: 'تشغيل مع ويندوز (وكيل بالخلفية)', type: 'checkbox', checked: !!c.autostart, click: i => { writeCfg({ autostart: i.checked }); app.setLoginItemSettings({ openAtLogin: i.checked, args: ['--agent'] }); } },
+    { type: 'separator' }, { role: 'quit', label: 'خروج' } ]);
+}
+async function startAgent() {
+  try {
+    agent = createAgent({ version: app.getVersion(), platform: process.platform, originOpts: { dev: DEV, hosts: [...EXTRA, ...(readCfg().hosts || [])] },
+      store: { get: readCfg, set: writeCfg },
+      getPrinters: async () => (await printer.diag()).printers.map(p => ({ ...p, thermal: escpos.looksThermal(p.name) })),
+      execute: agentExecute, onCode: c => { pairCode = c; if (DEV && process.env.MIQDAR_AGENT_CODE_FILE) try { fs.writeFileSync(process.env.MIQDAR_AGENT_CODE_FILE, c); } catch (_) {} } });
+    await agent.start(DEV && process.env.MIQDAR_AGENT_PORT ? Number(process.env.MIQDAR_AGENT_PORT) : undefined);
+  } catch (e) { agent = null; }
+  try { const img = nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }); tray = new Tray(img); tray.setToolTip('مقدار — وكيل الطباعة'); tray.setContextMenu(trayMenu()); tray.on('right-click', () => tray.setContextMenu(trayMenu())); tray.on('click', () => tray.setContextMenu(trayMenu())); } catch (_) { tray = null; }
+}
+ipcMain.handle('miqdar:agent', e => { if (!senderOk(e)) deny(); return { running: !!agent, port: agent ? agent.port() : 0 }; });
+
+app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((wc, perm, cb) => cb(false));   // no camera/mic/geo etc.
-  if (readCfg().autostart != null) app.setLoginItemSettings({ openAtLogin: !!readCfg().autostart });
-  buildMenu(); createWindow();
+  if (readCfg().autostart != null) app.setLoginItemSettings({ openAtLogin: !!readCfg().autostart, args: ['--agent'] });   // autostart = background agent (tray), no window
+  buildMenu(); await startAgent(); if (!BACKGROUND) createWindow();
   // silent background updates (Windows/NSIS unsigned OK; macOS needs a signed+notarized app). Check at start and every 4h; install when the app quits or on «restart now».
   // The WEB UI is not part of the app (loaded live from the server) — only this thin shell updates.
   if (app.isPackaged || (DEV && process.env.MIQDAR_UPDATE_URL)) {
@@ -197,5 +259,5 @@ app.whenReady().then(() => {
     } catch (_) {}
   }
 });
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => { if (!(BACKGROUND && tray)) app.quit(); });   // --agent keeps running in the tray
 app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
