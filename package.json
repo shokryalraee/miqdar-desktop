@@ -1,7 +1,7 @@
 {
   "name": "miqdar-cashier",
   "productName": "مقدار كاشير",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Miqdar Cashier — official Windows app: opens Miqdar and prints silently by printer name",
   "main": "main.js",
   "author": "Miqdar",

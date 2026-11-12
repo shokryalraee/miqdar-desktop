@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, shell, Menu, Tray, nativeImage, clipboard, session } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Menu, Tray, nativeImage, clipboard, dialog, session } = require('electron');
 const { execFile } = require('child_process');
 const path = require('path'), fs = require('fs'), os = require('os'), http = require('http'), https = require('https');
 const { createPrinter, isVirtual } = require('./lib/printing');
@@ -232,6 +232,15 @@ function trayMenu() {
     { label: 'تشغيل مع ويندوز (وكيل بالخلفية)', type: 'checkbox', checked: !!c.autostart, click: i => { writeCfg({ autostart: i.checked }); app.setLoginItemSettings({ openAtLogin: i.checked, args: ['--agent'] }); } },
     { type: 'separator' }, { role: 'quit', label: 'خروج' } ]);
 }
+// first run: ONE simple question — keep Miqdar as a background print agent (tray icon) starting with the computer? (default = yes). One install = app + print agent + auto-update.
+async function firstRunAsk() {
+  const c = readCfg(); if (c.firstRunDone || BACKGROUND || (DEV && !process.env.MIQDAR_ASK_FIRSTRUN)) return;
+  try {
+    const r = await dialog.showMessageBox(win && !win.isDestroyed() ? win : undefined, { type: 'question', buttons: ['نعم، شغّل مع ويندوز', 'لاحقاً'], defaultId: 0, cancelId: 1, title: 'مقدار',
+      message: 'تشغيل مقدار مع ويندوز كوكيل طباعة بالخلفية؟', detail: 'يبقى بجانب الساعة ويطبع مباشرة على أي طابعة بدون نوافذ، ويتحدث وحده. تقدر تغيّر هذا من أيقونة مقدار.' });
+    const yes = r.response === 0; writeCfg({ firstRunDone: true, autostart: yes }); app.setLoginItemSettings({ openAtLogin: yes, args: ['--agent'] });
+  } catch (_) { writeCfg({ firstRunDone: true }); }
+}
 async function startAgent() {
   try {
     agent = createAgent({ version: app.getVersion(), platform: process.platform, originOpts: { dev: DEV, hosts: [...EXTRA, ...(readCfg().hosts || [])] },
@@ -247,7 +256,7 @@ ipcMain.handle('miqdar:agent', e => { if (!senderOk(e)) deny(); return { running
 app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((wc, perm, cb) => cb(false));   // no camera/mic/geo etc.
   if (readCfg().autostart != null) app.setLoginItemSettings({ openAtLogin: !!readCfg().autostart, args: ['--agent'] });   // autostart = background agent (tray), no window
-  buildMenu(); await startAgent(); if (!BACKGROUND) createWindow();
+  buildMenu(); await startAgent(); if (!BACKGROUND) { createWindow(); win.once('ready-to-show', () => setTimeout(firstRunAsk, 1500)); }
   // silent background updates (Windows/NSIS unsigned OK; macOS needs a signed+notarized app). Check at start and every 4h; install when the app quits or on «restart now».
   // The WEB UI is not part of the app (loaded live from the server) — only this thin shell updates.
   if (app.isPackaged || (DEV && process.env.MIQDAR_UPDATE_URL)) {
@@ -259,5 +268,5 @@ app.whenReady().then(async () => {
     } catch (_) {}
   }
 });
-app.on('window-all-closed', () => { if (!(BACKGROUND && tray)) app.quit(); });   // --agent keeps running in the tray
+app.on('window-all-closed', () => { if (!(tray && (BACKGROUND || readCfg().autostart))) app.quit(); });   // background agent (--agent, or «start with Windows» chosen) keeps running in the tray
 app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
