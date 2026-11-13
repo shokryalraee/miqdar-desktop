@@ -20,7 +20,8 @@ let win, updater = null;
 if (process.platform === 'win32') app.setAppUserModelId('com.miqdarerp.cashier');   // proper Windows identity (taskbar / notifications)
 const ICON = path.join(__dirname, 'build', 'icon.png');
 if (!app.requestSingleInstanceLock()) app.quit();
-app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.focus(); } });
+// a second launch (or the tray/start menu) while the app runs in the background: show the window — never touch a destroyed one ("Object has been destroyed")
+app.on('second-instance', () => { try { if (win && !win.isDestroyed()) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); } else if (app.isReady()) createWindow(); } catch (e) { win = null; try { createWindow(); } catch (_) {} } });
 
 const senderOk = e => { try { return isAllowedOrigin(new URL(e.senderFrame.url).origin, OPTS) && e.senderFrame === e.sender.mainFrame; } catch (_) { return false; } };
 const deny = () => { const e = new Error('origin not allowed'); e.code = 'ORIGIN'; throw e; };
@@ -29,7 +30,8 @@ function createWindow() {
   win = new BrowserWindow({ width: 1280, height: 800, show: false, autoHideMenuBar: true, icon: ICON, fullscreen: !!readCfg().fullscreen,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
   win.webContents.on('before-input-event', (ev, input) => { if ((input.control || input.meta) && !input.alt && String(input.key).toLowerCase() === 'p' && input.type === 'keyDown') { ev.preventDefault(); printCurrentPage(win.webContents, {}).then(r => { if (!r.ok && win && !win.isDestroyed()) win.webContents.executeJavaScript('window.dispatchEvent(new CustomEvent("miqdar-print-error",{detail:' + JSON.stringify(String(r.error || '')) + '}))').catch(() => {}); }); } });   // Ctrl/Cmd+P → silent path, no dialog
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => { if (win && !win.isDestroyed()) win.show(); });
+  win.on('closed', () => { win = null; });
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });   // external links → system browser
   win.webContents.on('will-navigate', (ev, url) => { if (!isAllowedUrl(url, OPTS)) { ev.preventDefault(); if (/^https?:/.test(url)) shell.openExternal(url); } });
   // offline / unreachable: a calm local page with retry (never a blank window or an error box)
@@ -42,9 +44,9 @@ function createWindow() {
 function buildMenu() {
   const c = readCfg();
   Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: 'مقدار', submenu: [
-    { label: 'شاشة كاملة', type: 'checkbox', checked: !!c.fullscreen, accelerator: 'F11', click: i => { writeCfg({ fullscreen: i.checked }); win && win.setFullScreen(i.checked); } },
+    { label: 'شاشة كاملة', type: 'checkbox', checked: !!c.fullscreen, accelerator: 'F11', click: i => { writeCfg({ fullscreen: i.checked }); win && !win.isDestroyed() && win.setFullScreen(i.checked); } },
     { label: 'تشغيل مع ويندوز (وكيل الطباعة بالخلفية)', type: 'checkbox', checked: !!c.autostart, click: i => { writeCfg({ autostart: i.checked }); app.setLoginItemSettings({ openAtLogin: i.checked, args: ['--agent'] }); } },
-    { label: 'إعادة تحميل', accelerator: 'CmdOrCtrl+R', click: () => win && win.reload() },
+    { label: 'إعادة تحميل', accelerator: 'CmdOrCtrl+R', click: () => win && !win.isDestroyed() && win.reload() },
     { type: 'separator' }, { role: 'quit', label: 'خروج' } ] },
     { label: 'تحرير', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] }]));   // Edit menu: copy/paste shortcuts need it on macOS
 }
